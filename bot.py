@@ -55,6 +55,9 @@ SEARCH_STOPWORDS = {
     "grilled",
     "roast",
     "roasted",
+    "find",
+    "search",
+    "please",
     "рецепт",
     "рецепты",
     "как",
@@ -62,6 +65,7 @@ SEARCH_STOPWORDS = {
     "сделать",
     "нужен",
     "нужна",
+    "нужно",
     "хочу",
 }
 
@@ -74,22 +78,56 @@ RU_DISH_ALIASES: dict[str, list[str]] = {
     "яичница": ["omelette", "egg"],
     "омлет": ["omelette", "egg"],
     "яйца": ["omelette", "egg"],
+    "яйцо": ["omelette", "egg"],
     "блин": ["pancake", "blini"],
     "блины": ["pancake", "blini"],
     "оладьи": ["pancake"],
-    "наполеон": ["cake", "mille", "apple cake"],
+    "сырник": ["pancake", "cheesecake"],
+    "сырники": ["pancake", "cheesecake"],
+    "наполеон": ["cake", "apple cake"],
+    "медовик": ["cake", "honey"],
     "торт": ["cake", "cheesecake"],
     "чизкейк": ["cheesecake", "cake"],
     "печенье": ["cookie", "biscuit"],
     "пряник": ["gingerbread", "cookie"],
+    "пряники": ["gingerbread", "cookie"],
     "курица": ["chicken"],
+    "куриц": ["chicken"],
     "рыба": ["fish", "salmon"],
+    "лосось": ["salmon", "fish"],
     "суп": ["soup"],
+    "борщ": ["soup", "beet"],
+    "щи": ["soup"],
     "салат": ["salad"],
+    "оливье": ["salad"],
     "стейк": ["steak", "beef"],
+    "говядина": ["beef", "steak"],
+    "свинина": ["pork"],
     "бургер": ["burger"],
     "рис": ["rice"],
     "лапша": ["noodle", "ramen"],
+    "пельмен": ["dumpling"],
+    "вареник": ["dumpling"],
+    "шашлык": ["kebab", "pork"],
+    "кебаб": ["kebab"],
+    "плов": ["rice", "lamb"],
+    "картошка": ["potato"],
+    "картофель": ["potato"],
+    "макарон": ["pasta", "spaghetti"],
+    "лазанья": ["lasagna", "pasta"],
+    "ризотто": ["risotto", "rice"],
+    "суши": ["sushi", "salmon"],
+    "вафли": ["waffle", "pancake"],
+    "шоколад": ["chocolate", "cake"],
+    "тирамису": ["cake", "dessert"],
+    "брауни": ["brownie", "chocolate"],
+    "кекс": ["cake", "muffin"],
+    "маффин": ["muffin", "cake"],
+    "круассан": ["croissant", "pastry"],
+    "хачапури": ["bread", "cheese"],
+    "шаурма": ["wrap", "chicken"],
+    "сосиск": ["sausage"],
+    "котлет": ["beef", "chicken"],
 }
 
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -144,7 +182,9 @@ intent:
 
 recipe_query: 1-3 коротких английских названия блюда через запятую
   (только для recipe_search), БЕЗ слов recipe/how to cook.
-  Примеры: "pasta, spaghetti" | "omelette, egg" | "cake" | "".
+  Если пользователь пишет по-русски — ОБЯЗАТЕЛЬНО переведи в английские названия.
+  Примеры: «паста» → "pasta, spaghetti" | «яичница» → "omelette, egg"
+  | «борщ» → "soup" | «пельмени» → "dumpling" | «шашлык» → "kebab".
 """.strip()
 
 
@@ -211,12 +251,66 @@ def _clean_search_term(term: str) -> str:
 
 
 def _alias_terms(text: str) -> list[str]:
+    """Учитывает русские склонения: пасты/борща/сырников и т.п."""
     lowered = text.lower()
+    words = re.findall(r"[а-яёa-z0-9]+", lowered)
     terms: list[str] = []
     for ru, aliases in RU_DISH_ALIASES.items():
-        if ru in lowered:
+        stem = ru[: max(4, len(ru) - 1)] if len(ru) >= 4 else ru
+        matched = ru in lowered or any(
+            len(w) >= 3 and (w.startswith(stem) or stem.startswith(w[: len(stem)]))
+            for w in words
+        )
+        if matched:
             terms.extend(aliases)
     return terms
+
+
+def _has_cyrillic(text: str) -> bool:
+    return bool(re.search(r"[А-Яа-яЁё]", text or ""))
+
+
+def translate_dish_terms_to_english(user_text: str) -> list[str]:
+    """Переводит русский (и любой) запрос рецепта в английские ключи TheMealDB."""
+    prompt = f"""
+Пользователь ищет рецепт. Текст: {user_text}
+
+Верни ТОЛЬКО JSON без markdown:
+{{"terms":["term1","term2","term3"]}}
+
+rules:
+- terms: 2-4 коротких английских слова/фразы для поиска в TheMealDB;
+- только латиница;
+- без слов recipe, how, to, cook;
+- русские блюда переводи в ближайшие международные названия
+  (борщ→soup, пельмени→dumpling, шашлык→kebab, сырники→pancake,
+   медовик→cake, оливье→salad, плов→rice).
+""".strip()
+    raw = _completion(
+        [
+            {
+                "role": "system",
+                "content": "Ты переводишь названия блюд в английские поисковые ключи.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=400,
+    )
+    try:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        data = json.loads(match.group(0) if match else raw)
+        terms = data.get("terms") or []
+        result: list[str] = []
+        for term in terms:
+            cleaned = _clean_search_term(str(term))
+            if cleaned and re.fullmatch(r"[A-Za-z0-9 ]+", cleaned):
+                result.append(cleaned)
+                first = cleaned.split()[0]
+                if first not in SEARCH_STOPWORDS and first not in result:
+                    result.append(first)
+        return result[:6]
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return []
 
 
 def build_search_terms(user_text: str, recipe_query: str) -> list[str]:
@@ -229,7 +323,8 @@ def build_search_terms(user_text: str, recipe_query: str) -> list[str]:
 
     for part in re.split(r"[,/;|]+", recipe_query or ""):
         cleaned = _clean_search_term(part)
-        if cleaned:
+        # В keys поиска допускаем только латиницу (TheMealDB не понимает кириллицу).
+        if cleaned and re.fullmatch(r"[A-Za-z0-9 ]+", cleaned):
             candidates.append(cleaned)
             first = cleaned.split()[0]
             if first and first not in SEARCH_STOPWORDS:
@@ -242,11 +337,23 @@ def build_search_terms(user_text: str, recipe_query: str) -> list[str]:
         if first not in SEARCH_STOPWORDS:
             candidates.append(first)
 
+    # Если английских ключей ещё нет — переводим русский запрос через модель.
+    latin_ready = [
+        c for c in candidates if re.fullmatch(r"[A-Za-z0-9 ]+", c.strip() or "")
+    ]
+    if not latin_ready and user_text.strip():
+        candidates.extend(translate_dish_terms_to_english(user_text))
+
     seen: set[str] = set()
     result: list[str] = []
     for term in candidates:
         key = term.lower().strip()
-        if not key or key in seen or key in SEARCH_STOPWORDS:
+        if (
+            not key
+            or key in seen
+            or key in SEARCH_STOPWORDS
+            or not re.fullmatch(r"[a-z0-9 ]+", key)
+        ):
             continue
         seen.add(key)
         result.append(term.strip())
@@ -277,6 +384,10 @@ def search_recipes(
     limit: int = MAX_RECIPE_CHOICES,
 ) -> list[dict]:
     terms = build_search_terms(user_text, recipe_query)
+    # Если после алиасов пусто — ещё одна попытка перевода.
+    if not terms and user_text.strip():
+        terms = translate_dish_terms_to_english(user_text)
+
     results: list[dict] = []
     seen_ids: set[str] = set()
 
