@@ -8,7 +8,7 @@ import requests
 import telebot
 from dotenv import load_dotenv
 from openai import OpenAI
-from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
+from telebot.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 
 load_dotenv()
 
@@ -23,10 +23,74 @@ if not OPENAI_API_KEY:
 MODEL = "gpt-5-nano"
 MEALDB_SEARCH = "https://www.themealdb.com/api/json/v1/1/search.php?s={query}"
 MEALDB_LOOKUP = "https://www.themealdb.com/api/json/v1/1/lookup.php?i={meal_id}"
+MEALDB_FILTER_INGREDIENT = (
+    "https://www.themealdb.com/api/json/v1/1/filter.php?i={ingredient}"
+)
 BLAGOVA_CHAT_URL = "https://t.me/Nadejda1831"
 MAX_RECIPE_CHOICES = 3
 MAX_HISTORY_MESSAGES = 10
 HTTP_TIMEOUT = 15
+
+# TheMealDB понимает короткие английские названия блюд, без слова "recipe".
+SEARCH_STOPWORDS = {
+    "recipe",
+    "recipes",
+    "how",
+    "to",
+    "make",
+    "cook",
+    "cooking",
+    "dish",
+    "food",
+    "meal",
+    "with",
+    "and",
+    "for",
+    "a",
+    "an",
+    "the",
+    "fried",
+    "boiled",
+    "baked",
+    "grilled",
+    "roast",
+    "roasted",
+    "рецепт",
+    "рецепты",
+    "как",
+    "приготовить",
+    "сделать",
+    "нужен",
+    "нужна",
+    "хочу",
+}
+
+# Частые русские запросы → рабочие ключи TheMealDB.
+RU_DISH_ALIASES: dict[str, list[str]] = {
+    "паста": ["pasta", "spaghetti", "carbonara", "penne"],
+    "спагетти": ["spaghetti", "carbonara", "bolognese"],
+    "карбонара": ["carbonara", "spaghetti"],
+    "пицца": ["pizza"],
+    "яичница": ["omelette", "egg"],
+    "омлет": ["omelette", "egg"],
+    "яйца": ["omelette", "egg"],
+    "блин": ["pancake", "blini"],
+    "блины": ["pancake", "blini"],
+    "оладьи": ["pancake"],
+    "наполеон": ["cake", "mille", "apple cake"],
+    "торт": ["cake", "cheesecake"],
+    "чизкейк": ["cheesecake", "cake"],
+    "печенье": ["cookie", "biscuit"],
+    "пряник": ["gingerbread", "cookie"],
+    "курица": ["chicken"],
+    "рыба": ["fish", "salmon"],
+    "суп": ["soup"],
+    "салат": ["salad"],
+    "стейк": ["steak", "beef"],
+    "бургер": ["burger"],
+    "рис": ["rice"],
+    "лапша": ["noodle", "ramen"],
+}
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -77,7 +141,9 @@ intent:
   без запроса «найди рецепт»;
 - off_topic — всё остальное (учёба, работа, тексты, планы, финансы, общие темы не про еду).
 
-recipe_query: краткий поисковый запрос на английском для базы рецептов (только для recipe_search), иначе "".
+recipe_query: 1-3 коротких английских названия блюда через запятую
+  (только для recipe_search), БЕЗ слов recipe/how to cook.
+  Примеры: "pasta, spaghetti" | "omelette, egg" | "cake" | "".
 """.strip()
 
 
@@ -137,28 +203,113 @@ def _meal_ingredients(meal: dict) -> list[str]:
     return items
 
 
-def search_recipes(query: str, limit: int = MAX_RECIPE_CHOICES) -> list[dict]:
-    query = query.strip()
-    if not query:
-        return []
+def _clean_search_term(term: str) -> str:
+    words = re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", term.lower())
+    kept = [w for w in words if w not in SEARCH_STOPWORDS]
+    return " ".join(kept).strip()
 
+
+def _alias_terms(text: str) -> list[str]:
+    lowered = text.lower()
+    terms: list[str] = []
+    for ru, aliases in RU_DISH_ALIASES.items():
+        if ru in lowered:
+            terms.extend(aliases)
+    return terms
+
+
+def build_search_terms(user_text: str, recipe_query: str) -> list[str]:
+    """Собирает короткие английские ключи, которые реально находит TheMealDB."""
+    candidates: list[str] = []
+
+    # Сначала алиасы по русскому тексту — они самые надёжные.
+    candidates.extend(_alias_terms(user_text))
+    candidates.extend(_alias_terms(recipe_query or ""))
+
+    for part in re.split(r"[,/;|]+", recipe_query or ""):
+        cleaned = _clean_search_term(part)
+        if cleaned:
+            candidates.append(cleaned)
+            first = cleaned.split()[0]
+            if first and first not in SEARCH_STOPWORDS:
+                candidates.append(first)
+
+    cleaned_user = _clean_search_term(user_text)
+    if cleaned_user and re.fullmatch(r"[A-Za-z0-9 ]+", cleaned_user):
+        candidates.append(cleaned_user)
+        first = cleaned_user.split()[0]
+        if first not in SEARCH_STOPWORDS:
+            candidates.append(first)
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for term in candidates:
+        key = term.lower().strip()
+        if not key or key in seen or key in SEARCH_STOPWORDS:
+            continue
+        seen.add(key)
+        result.append(term.strip())
+    return result[:8]
+
+
+def _mealdb_search(term: str) -> list[dict]:
     response = requests.get(
-        MEALDB_SEARCH.format(query=quote(query)),
+        MEALDB_SEARCH.format(query=quote(term)),
         timeout=HTTP_TIMEOUT,
     )
     response.raise_for_status()
-    meals = response.json().get("meals") or []
-    results: list[dict] = []
-    for meal in meals[:limit]:
-        results.append(
-            {
-                "id": meal["idMeal"],
-                "title": meal.get("strMeal") or "Без названия",
-                "thumb": meal.get("strMealThumb") or "",
-            }
-        )
-    return results
+    return response.json().get("meals") or []
 
+
+def _mealdb_filter_ingredient(ingredient: str) -> list[dict]:
+    response = requests.get(
+        MEALDB_FILTER_INGREDIENT.format(ingredient=quote(ingredient)),
+        timeout=HTTP_TIMEOUT,
+    )
+    response.raise_for_status()
+    return response.json().get("meals") or []
+
+
+def search_recipes(
+    user_text: str,
+    recipe_query: str = "",
+    limit: int = MAX_RECIPE_CHOICES,
+) -> list[dict]:
+    terms = build_search_terms(user_text, recipe_query)
+    results: list[dict] = []
+    seen_ids: set[str] = set()
+
+    def add_meals(meals: list[dict]) -> None:
+        for meal in meals:
+            meal_id = str(meal.get("idMeal") or "")
+            if not meal_id or meal_id in seen_ids:
+                continue
+            seen_ids.add(meal_id)
+            results.append(
+                {
+                    "id": meal_id,
+                    "title": meal.get("strMeal") or "Без названия",
+                    "thumb": meal.get("strMealThumb") or "",
+                }
+            )
+            if len(results) >= limit:
+                return
+
+    for term in terms:
+        add_meals(_mealdb_search(term))
+        if len(results) >= limit:
+            return results
+
+    # Запасной путь: фильтр по ингредиенту (egg, chicken, pasta…)
+    for term in terms:
+        token = term.split()[0]
+        if len(token) < 3:
+            continue
+        add_meals(_mealdb_filter_ingredient(token))
+        if len(results) >= limit:
+            break
+
+    return results[:limit]
 
 def fetch_recipe(meal_id: str) -> dict | None:
     response = requests.get(
@@ -283,12 +434,18 @@ def send_forbidden_search_reply(chat_id: int, reply_to: int | None = None) -> No
     send_promo_footer(chat_id)
 
 
-def send_recipe_choices(chat_id: int, query: str, reply_to: int | None = None) -> None:
-    recipes = search_recipes(query)
+def send_recipe_choices(
+    chat_id: int,
+    user_text: str,
+    recipe_query: str = "",
+    reply_to: int | None = None,
+) -> None:
+    recipes = search_recipes(user_text, recipe_query)
     if not recipes:
         bot.send_message(
             chat_id,
-            "Не нашёл рецептов по этому запросу. Попробуйте другое название блюда.",
+            "Не нашёл рецептов по этому запросу. Попробуйте другое название блюда "
+            "(например: паста, омлет, курица, торт).",
             reply_to_message_id=reply_to,
         )
         send_promo_footer(chat_id)
@@ -307,6 +464,28 @@ def send_recipe_choices(chat_id: int, query: str, reply_to: int | None = None) -
     send_promo_footer(chat_id)
 
 
+def setup_bot_commands() -> None:
+    """Меню Telegram: только рабочие команды."""
+    bot.delete_my_commands()
+    bot.set_my_commands(
+        [
+            BotCommand("start", "О боте и сброс диалога"),
+            BotCommand("help", "Чем могу помочь"),
+            BotCommand("recipe", "Пример: /recipe паста"),
+        ]
+    )
+
+
+HELP_TEXT = (
+    "Я помощник пекарни BLAGOVA_SWEETS.\n\n"
+    "Могу:\n"
+    "• найти рецепт — напишите «рецепт пасты» или /recipe паста;\n"
+    "• подсказать по выпечке, тортам и пряникам;\n"
+    "• связать с менеджером для заказа.\n\n"
+    "Не ищу погоду, новости и прочие темы вне еды/пекарни."
+)
+
+
 @bot.message_handler(commands=["start"])
 def handle_start(message: telebot.types.Message) -> None:
     chat_histories[message.chat.id].clear()
@@ -319,6 +498,31 @@ def handle_start(message: telebot.types.Message) -> None:
             "Извините, не удалось получить ответ. Попробуйте ещё раз позже.",
         )
     send_promo_footer(message.chat.id)
+
+
+@bot.message_handler(commands=["help"])
+def handle_help(message: telebot.types.Message) -> None:
+    bot.reply_to(message, HELP_TEXT, reply_markup=blagova_keyboard())
+    send_promo_footer(message.chat.id)
+
+
+@bot.message_handler(commands=["recipe"])
+def handle_recipe_command(message: telebot.types.Message) -> None:
+    query = message.text.split(maxsplit=1)
+    dish = query[1].strip() if len(query) > 1 else ""
+    if not dish:
+        bot.reply_to(
+            message,
+            "Напишите блюдо после команды, например:\n/recipe паста",
+        )
+        send_promo_footer(message.chat.id)
+        return
+    send_recipe_choices(
+        message.chat.id,
+        dish,
+        dish,
+        reply_to=message.message_id,
+    )
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("recipe:"))
@@ -396,15 +600,22 @@ def handle_text(message: telebot.types.Message) -> None:
             return
 
         if intent == "recipe_search":
-            query = classified["recipe_query"] or user_text
-            send_recipe_choices(message.chat.id, query, message.message_id)
+            send_recipe_choices(
+                message.chat.id,
+                user_text,
+                classified["recipe_query"],
+                reply_to=message.message_id,
+            )
             chat_histories[message.chat.id].append(
                 {"role": "user", "content": user_text}
             )
             chat_histories[message.chat.id].append(
                 {
                     "role": "assistant",
-                    "content": f"Показаны варианты рецептов по запросу: {query}",
+                    "content": (
+                        "Показаны варианты рецептов по запросу: "
+                        f"{classified['recipe_query'] or user_text}"
+                    ),
                 }
             )
             return
@@ -421,4 +632,5 @@ def handle_text(message: telebot.types.Message) -> None:
 
 
 if __name__ == "__main__":
+    setup_bot_commands()
     bot.infinity_polling()
