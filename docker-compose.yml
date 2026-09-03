@@ -1,0 +1,20 @@
+services:
+  bot:
+    image: andreiblagov/telegram-chatgpt-bot:latest
+    build: .
+    env_file:
+      - .env
+    restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  # На VPS подтягивает новый образ с Docker Hub и перезапускает bot
+  watchtower:
+    image: containrrr/watchtower:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_POLL_INTERVAL: "60"
+      WATCHTOWER_LABEL_ENABLE: "true"
+    restart: unless-stopped
