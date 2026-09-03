@@ -480,6 +480,9 @@ def translate_recipe_to_ru(recipe: dict) -> str:
 
 PROMO_TEXT = "Вкуснейшие торты и имбирные пряники для вашего торжества!"
 
+# message_id последнего промо в каждом чате — чтобы удалять перед новым
+promo_message_ids: dict[int, int] = {}
+
 
 def blagova_keyboard() -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup()
@@ -493,8 +496,16 @@ def blagova_keyboard() -> InlineKeyboardMarkup:
 
 
 def send_promo_footer(chat_id: int) -> None:
-    """Промо-сообщение с кнопкой после каждого ответа бота."""
-    bot.send_message(chat_id, PROMO_TEXT, reply_markup=blagova_keyboard())
+    """Промо после ответа; предыдущее промо в этом чате удаляется."""
+    old_id = promo_message_ids.get(chat_id)
+    if old_id:
+        try:
+            bot.delete_message(chat_id, old_id)
+        except Exception:
+            pass
+
+    msg = bot.send_message(chat_id, PROMO_TEXT, reply_markup=blagova_keyboard())
+    promo_message_ids[chat_id] = msg.message_id
 
 
 def recipe_keyboard(recipes: list[dict]) -> InlineKeyboardMarkup:
@@ -503,13 +514,49 @@ def recipe_keyboard(recipes: list[dict]) -> InlineKeyboardMarkup:
         title = recipe["title"]
         if len(title) > 60:
             title = title[:57] + "..."
+        # Короткий callback_data: r:<id> (лимит Telegram — 64 байта)
         markup.add(
             InlineKeyboardButton(
                 title,
-                callback_data=f"recipe:{recipe['id']}",
+                callback_data=f"r:{recipe['id']}",
             )
         )
     return markup
+
+
+def format_recipe_text(recipe: dict) -> str:
+    """Быстрая карточка рецепта без ожидания LLM (кнопка открывается сразу)."""
+    ingredients = "\n".join(f"• {item}" for item in recipe["ingredients"]) or "—"
+    instructions = (recipe["instructions"] or "").strip() or "—"
+    header = recipe["title"]
+    meta_parts = [p for p in (recipe.get("category"), recipe.get("area")) if p]
+    meta = " / ".join(meta_parts)
+
+    text = f"{header}\n"
+    if meta:
+        text += f"{meta}\n"
+    text += f"\nИнгредиенты:\n{ingredients}\n\nПриготовление:\n{instructions}"
+    if len(text) > 3500:
+        text = text[:3490] + "…"
+    return text
+
+
+def send_recipe_card(chat_id: int, recipe: dict) -> None:
+    # Сразу показываем карточку из TheMealDB — без ожидания LLM,
+    # иначе нажатие кнопки выглядит как «ничего не происходит».
+    text = format_recipe_text(recipe)
+
+    if recipe.get("thumb"):
+        caption = text if len(text) <= 1024 else text[:1000] + "…"
+        try:
+            bot.send_photo(chat_id, recipe["thumb"], caption=caption)
+            if len(text) > 1024:
+                bot.send_message(chat_id, text)
+            return
+        except Exception:
+            pass
+
+    bot.send_message(chat_id, text)
 
 
 def send_off_topic_reply(chat_id: int, reply_to: int | None = None) -> None:
@@ -641,37 +688,30 @@ def handle_recipe_command(message: telebot.types.Message) -> None:
     )
 
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("recipe:"))
+@bot.callback_query_handler(func=lambda call: bool(call.data) and call.data.startswith("r:"))
 def handle_recipe_callback(call: telebot.types.CallbackQuery) -> None:
-    meal_id = call.data.split(":", 1)[1]
-    bot.answer_callback_query(call.id, "Открываю рецепт...")
-    chat_id = call.message.chat.id
+    meal_id = call.data.split(":", 1)[1].strip()
+    chat_id = call.message.chat.id if call.message else call.from_user.id
+
+    # Сразу снимаем «часики» у кнопки — иначе кажется, что ничего не происходит.
     try:
+        bot.answer_callback_query(call.id, "Открываю рецепт…")
+    except Exception:
+        pass
+
+    try:
+        bot.send_chat_action(chat_id, "typing")
         recipe = fetch_recipe(meal_id)
         if not recipe:
-            bot.send_message(chat_id, "Рецепт не найден.")
+            bot.send_message(chat_id, "Рецепт не найден. Выберите другой вариант.")
             send_promo_footer(chat_id)
             return
 
-        text = translate_recipe_to_ru(recipe)
-        if len(text) > 3500:
-            text = text[:3490] + "…"
-
-        if recipe["thumb"]:
-            caption = text if len(text) <= 1024 else text[:1000] + "…"
-            bot.send_photo(
-                chat_id,
-                recipe["thumb"],
-                caption=caption,
-            )
-            if len(text) > 1024:
-                bot.send_message(chat_id, text)
-        else:
-            bot.send_message(chat_id, text)
+        send_recipe_card(chat_id, recipe)
     except Exception:
         bot.send_message(
             chat_id,
-            "Не удалось загрузить рецепт. Попробуйте ещё раз.",
+            "Не удалось загрузить рецепт. Попробуйте нажать ещё раз или выбрать другой.",
         )
     send_promo_footer(chat_id)
 
@@ -749,4 +789,5 @@ def handle_text(message: telebot.types.Message) -> None:
 
 if __name__ == "__main__":
     setup_bot_commands()
-    bot.infinity_polling()
+    # Явно принимаем и сообщения, и нажатия inline-кнопок
+    bot.infinity_polling(allowed_updates=["message", "callback_query"])
