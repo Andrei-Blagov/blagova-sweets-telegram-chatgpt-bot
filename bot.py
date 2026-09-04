@@ -1,6 +1,8 @@
 import json
+import logging
 import os
 import re
+import sys
 from collections import defaultdict, deque
 from urllib.parse import quote
 
@@ -12,12 +14,67 @@ from telebot.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 
 load_dotenv()
 
+
+def setup_logging() -> logging.Logger:
+    """Console logging always; Better Stack only when env vars are set."""
+    app_logger = logging.getLogger("blagova_sweets")
+    if app_logger.handlers:
+        return app_logger
+
+    app_logger.setLevel(logging.INFO)
+    app_logger.propagate = False
+
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(logging.INFO)
+    console.setFormatter(formatter)
+    app_logger.addHandler(console)
+
+    source_token = (os.getenv("BETTERSTACK_SOURCE_TOKEN") or "").strip()
+    ingesting_host = (os.getenv("BETTERSTACK_INGESTING_HOST") or "").strip()
+
+    if source_token and ingesting_host:
+        try:
+            from logtail import LogtailHandler
+
+            host = ingesting_host
+            if not host.startswith(("http://", "https://")):
+                host = f"https://{host}"
+
+            logtail_handler = LogtailHandler(
+                source_token=source_token,
+                host=host,
+            )
+            logtail_handler.setLevel(logging.INFO)
+            app_logger.addHandler(logtail_handler)
+            app_logger.info("Better Stack logging enabled")
+        except Exception:
+            app_logger.exception(
+                "Failed to initialize Better Stack logging; continuing with console only"
+            )
+    else:
+        app_logger.info(
+            "Better Stack env vars not set; using console logging only"
+        )
+
+    return app_logger
+
+
+logger = setup_logging()
+logger.info("Application starting")
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not BOT_TOKEN:
+    logger.error("BOT_TOKEN environment variable is not set")
     raise RuntimeError("Переменная окружения BOT_TOKEN не задана")
 if not OPENAI_API_KEY:
+    logger.error("OPENAI_API_KEY environment variable is not set")
     raise RuntimeError("Переменная окружения OPENAI_API_KEY не задана")
 
 MODEL = "gpt-5-nano"
@@ -132,6 +189,7 @@ RU_DISH_ALIASES: dict[str, list[str]] = {
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 bot = telebot.TeleBot(BOT_TOKEN)
+logger.info("Telegram bot client initialized")
 
 chat_histories: dict[int, deque] = defaultdict(
     lambda: deque(maxlen=MAX_HISTORY_MESSAGES)
@@ -220,6 +278,7 @@ def classify_message(user_text: str) -> dict:
             "recipe_query": str(data.get("recipe_query") or "").strip(),
         }
     except (json.JSONDecodeError, AttributeError, TypeError):
+        logger.warning("Failed to parse message classification JSON; defaulting to chat")
         return {"intent": "chat", "recipe_query": ""}
 
 
@@ -478,6 +537,53 @@ def translate_recipe_to_ru(recipe: dict) -> str:
     )
 
 
+def translate_recipe_titles_to_ru(recipes: list[dict]) -> list[dict]:
+    """Переводит названия вариантов на русский одним запросом."""
+    if not recipes:
+        return recipes
+
+    titles = [str(r.get("title") or "").strip() for r in recipes]
+    prompt = f"""
+Переведи названия блюд на русский ясно и кратко.
+Верни ТОЛЬКО JSON без markdown:
+{{"titles":["название1","название2"]}}
+
+Правила:
+- столько же элементов, сколько во входном списке, в том же порядке;
+- без нумерации и пояснений;
+- естественные русские названия блюд.
+
+Вход:
+{json.dumps(titles, ensure_ascii=False)}
+""".strip()
+    try:
+        raw = _completion(
+            [
+                {
+                    "role": "system",
+                    "content": "Ты переводишь названия блюд на русский язык.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=400,
+        )
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        data = json.loads(match.group(0) if match else raw)
+        translated = data.get("titles") or []
+        if len(translated) != len(recipes):
+            raise ValueError(
+                f"title count mismatch: got {len(translated)}, expected {len(recipes)}"
+            )
+        for recipe, new_title in zip(recipes, translated):
+            text = str(new_title or "").strip()
+            if text:
+                recipe["title"] = text
+    except Exception:
+        logger.warning("Failed to translate recipe titles; keeping originals", exc_info=True)
+
+    return recipes
+
+
 PROMO_TEXT = "Вкуснейшие торты и имбирные пряники для вашего торжества!"
 
 # message_id последнего промо в каждом чате — чтобы удалять перед новым
@@ -502,7 +608,7 @@ def send_promo_footer(chat_id: int) -> None:
         try:
             bot.delete_message(chat_id, old_id)
         except Exception:
-            pass
+            logger.debug("Could not delete previous promo message", exc_info=True)
 
     msg = bot.send_message(chat_id, PROMO_TEXT, reply_markup=blagova_keyboard())
     promo_message_ids[chat_id] = msg.message_id
@@ -542,9 +648,22 @@ def format_recipe_text(recipe: dict) -> str:
 
 
 def send_recipe_card(chat_id: int, recipe: dict) -> None:
-    # Сразу показываем карточку из TheMealDB — без ожидания LLM,
-    # иначе нажатие кнопки выглядит как «ничего не происходит».
-    text = format_recipe_text(recipe)
+    """Отправляет карточку рецепта на русском (перевод через LLM)."""
+    bot.send_chat_action(chat_id, "typing")
+    try:
+        text = (translate_recipe_to_ru(recipe) or "").strip()
+        if not text:
+            raise ValueError("empty translation")
+    except Exception:
+        logger.warning(
+            "Recipe translation failed for meal_id=%s; using English fallback",
+            recipe.get("id"),
+            exc_info=True,
+        )
+        text = format_recipe_text(recipe)
+
+    if len(text) > 3500:
+        text = text[:3490] + "…"
 
     if recipe.get("thumb"):
         caption = text if len(text) <= 1024 else text[:1000] + "…"
@@ -554,7 +673,11 @@ def send_recipe_card(chat_id: int, recipe: dict) -> None:
                 bot.send_message(chat_id, text)
             return
         except Exception:
-            pass
+            logger.warning(
+                "Failed to send recipe photo for meal_id=%s; falling back to text",
+                recipe.get("id"),
+                exc_info=True,
+            )
 
     bot.send_message(chat_id, text)
 
@@ -601,6 +724,7 @@ def send_recipe_choices(
 ) -> None:
     recipes = search_recipes(user_text, recipe_query)
     if not recipes:
+        logger.warning("No recipes found for search request")
         bot.send_message(
             chat_id,
             "Не нашёл рецептов по этому запросу. Попробуйте другое название блюда "
@@ -609,6 +733,11 @@ def send_recipe_choices(
         )
         send_promo_footer(chat_id)
         return
+
+    logger.info("Recipe search returned %s options", len(recipes))
+
+    bot.send_chat_action(chat_id, "typing")
+    recipes = translate_recipe_titles_to_ru(recipes)
 
     lines = ["Нашёл варианты рецептов — выберите один:"]
     for i, recipe in enumerate(recipes, start=1):
@@ -633,6 +762,7 @@ def setup_bot_commands() -> None:
             BotCommand("recipe", "Пример: /recipe паста"),
         ]
     )
+    logger.info("Telegram bot commands configured")
 
 
 HELP_TEXT = (
@@ -654,6 +784,7 @@ START_TEXT = (
 
 @bot.message_handler(commands=["start"])
 def handle_start(message: telebot.types.Message) -> None:
+    logger.info("Command /start received")
     chat_histories[message.chat.id].clear()
     bot.reply_to(message, START_TEXT, reply_markup=blagova_keyboard())
     chat_histories[message.chat.id].append({"role": "user", "content": "/start"})
@@ -665,6 +796,7 @@ def handle_start(message: telebot.types.Message) -> None:
 
 @bot.message_handler(commands=["help"])
 def handle_help(message: telebot.types.Message) -> None:
+    logger.info("Command /help received")
     bot.reply_to(message, HELP_TEXT, reply_markup=blagova_keyboard())
     send_promo_footer(message.chat.id)
 
@@ -674,12 +806,14 @@ def handle_recipe_command(message: telebot.types.Message) -> None:
     query = message.text.split(maxsplit=1)
     dish = query[1].strip() if len(query) > 1 else ""
     if not dish:
+        logger.info("Command /recipe without dish name")
         bot.reply_to(
             message,
             "Напишите блюдо после команды, например:\n/recipe паста",
         )
         send_promo_footer(message.chat.id)
         return
+    logger.info("Command /recipe: searching recipes")
     send_recipe_choices(
         message.chat.id,
         dish,
@@ -692,23 +826,27 @@ def handle_recipe_command(message: telebot.types.Message) -> None:
 def handle_recipe_callback(call: telebot.types.CallbackQuery) -> None:
     meal_id = call.data.split(":", 1)[1].strip()
     chat_id = call.message.chat.id if call.message else call.from_user.id
+    logger.info("Recipe callback selected meal_id=%s", meal_id)
 
     # Сразу снимаем «часики» у кнопки — иначе кажется, что ничего не происходит.
     try:
-        bot.answer_callback_query(call.id, "Открываю рецепт…")
+        bot.answer_callback_query(call.id, "Перевожу рецепт на русский…")
     except Exception:
-        pass
+        logger.warning("Failed to answer callback query", exc_info=True)
 
     try:
         bot.send_chat_action(chat_id, "typing")
         recipe = fetch_recipe(meal_id)
         if not recipe:
+            logger.warning("Recipe not found for meal_id=%s", meal_id)
             bot.send_message(chat_id, "Рецепт не найден. Выберите другой вариант.")
             send_promo_footer(chat_id)
             return
 
         send_recipe_card(chat_id, recipe)
+        logger.info("Recipe card sent for meal_id=%s", meal_id)
     except Exception:
+        logger.exception("Failed to load recipe meal_id=%s", meal_id)
         bot.send_message(
             chat_id,
             "Не удалось загрузить рецепт. Попробуйте нажать ещё раз или выбрать другой.",
@@ -722,6 +860,7 @@ def handle_text(message: telebot.types.Message) -> None:
     try:
         classified = classify_message(user_text)
         intent = classified["intent"]
+        logger.info("Text message classified as intent=%s", intent)
 
         if intent == "forbidden_search":
             send_forbidden_search_reply(message.chat.id, message.message_id)
@@ -780,6 +919,7 @@ def handle_text(message: telebot.types.Message) -> None:
         bot.reply_to(message, answer)
         send_promo_footer(message.chat.id)
     except Exception:
+        logger.exception("Unhandled error while processing text message")
         bot.reply_to(
             message,
             "Извините, не удалось получить ответ. Попробуйте ещё раз позже.",
@@ -788,6 +928,15 @@ def handle_text(message: telebot.types.Message) -> None:
 
 
 if __name__ == "__main__":
-    setup_bot_commands()
-    # Явно принимаем и сообщения, и нажатия inline-кнопок
-    bot.infinity_polling(allowed_updates=["message", "callback_query"])
+    try:
+        setup_bot_commands()
+        logger.info("Starting Telegram polling")
+        # Явно принимаем и сообщения, и нажатия inline-кнопок
+        bot.infinity_polling(allowed_updates=["message", "callback_query"])
+    except KeyboardInterrupt:
+        logger.info("Shutdown requested (KeyboardInterrupt)")
+    except Exception:
+        logger.exception("Fatal error in bot main loop")
+        raise
+    finally:
+        logger.info("Application stopped")
